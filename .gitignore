@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+__pycache__/
+*.pyc
+backend/models/
+
+# Local editor/session config, not part of the project.
+.claude/
+
+# Capture images are regenerable; captures.csv is NOT - identify.py matches
+# live readings against it, so the reference waveforms must stay in the repo.
+backend/captures/*.png
