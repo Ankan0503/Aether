@@ -11,3 +11,17 @@ backend/models/
 # Capture images are regenerable; captures.csv is NOT - identify.py matches
 # live readings against it, so the reference waveforms must stay in the repo.
 backend/captures/*.png
+
+# Firmware credentials - MQTT broker user/pass. Never commit.
+firmware/**/secrets.h
+
+# Python virtual environments - rebuilt from requirements.txt, never committed.
+venv/
+.venv/
+
+# Django's local SQLite file. The project runs on Tiger Cloud; a stray sqlite
+# file in the repo only invites someone to run against the wrong database.
+db.sqlite3
+
+# Matplotlib output from the bench tools.
+backend/captures/*.csv.bak
