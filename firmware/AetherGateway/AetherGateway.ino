@@ -5,10 +5,11 @@
 // (current) on the same circuit, and reports true active power, power factor
 // and accumulated energy.
 //
-// Deliberately standalone: no Wi-Fi, no MQTT, no ESP-NOW. The metering has to
-// be calibrated and trusted before any of that is worth adding, and the same
-// bench-first approach is what caught the calibration faults in the subnode.
-// Networking slots in afterwards without touching Metering.h.
+// Networking lives in Mesh.h: Wi-Fi provisioning through a captive portal,
+// ESP-NOW to the subnodes, MQTT over TLS to the backend. Metering.h knows
+// nothing about any of it, so the meter can still be calibrated over serial
+// with no network present - and the local safety cutoff keeps working when the
+// internet is down, which is the whole point of the mesh.
 //
 // Pins - see firmware/PINOUT.md:
 //   ZMPT101B OUT -> GPIO 35      ACS712 OUT -> GPIO 34
@@ -26,16 +27,27 @@
 //   reset          zero the energy counter
 //   calv <volts>   calibrate voltage against a multimeter reading
 //   calw <watts>   calibrate current against a known resistive load
+//   net            Wi-Fi, MQTT and mesh status
+//   forget         wipe Wi-Fi and mesh credentials, then restart
 //   ?              help
 // ============================================================================
 
 #include "Metering.h"
+#include "Mesh.h"
 
 const int VOLTAGE_PIN = 35;   // ZMPT101B  - ADC1, input-only
 const int CURRENT_PIN = 34;   // ACS712    - ADC1, input-only
 const int RELAY_PIN   = 23;   // main relay, active LOW
 const int BUZZER_PIN  = 25;
 const int STATUS_LED  = 2;
+const int RESET_PIN   = 0;    // onboard BOOT button - hold 5s to wipe settings
+
+// Local overcurrent protection. This trips WITHOUT the network: the gateway
+// measures the whole supply, so it can cut before a fault becomes a fire even
+// with the broker unreachable. Aether compared a raw ADC count and shipped the
+// threshold at 4095, which disabled it; here it is a real amp figure from the
+// calibrated meter, so the number means something.
+const float OVERCURRENT_AMPS = 12.0f;
 
 const int RELAY_ON  = LOW;
 const int RELAY_OFF = HIGH;
@@ -47,6 +59,13 @@ MtEnergy energy;
 bool relayClosed = false;
 bool streaming = false;
 unsigned long lastStream = 0;
+
+// Safety state. `tripped` latches until something clears it deliberately -
+// a hazard cutoff must not undo itself because the next reading looked calm.
+bool tripped = false;
+String safetyStatus = "SAFE";
+unsigned long lastTelemetryPublish = 0;
+const unsigned long telemetryIntervalMs = 2000;
 
 void setRelay(bool closed) {
     digitalWrite(RELAY_PIN, closed ? RELAY_ON : RELAY_OFF);
@@ -128,6 +147,69 @@ void printEnergy() {
                   mtCostRupees(energy, TARIFF_RUPEES_PER_KWH), TARIFF_RUPEES_PER_KWH);
 }
 
+// Called by Mesh.h for commands aimed at this gateway's own hardware. Kept
+// here rather than in the mesh layer so that header stays free of the pin map.
+void meshHandleGatewayCommand(const String& action, JsonDocument& doc) {
+    if (action == "RESET_SAFETY") {
+        tripped = false;
+        safetyStatus = "SAFE";
+        setRelay(true);
+        digitalWrite(BUZZER_PIN, LOW);
+        Serial.println("Safety reset from the dashboard: supply restored.");
+    } else if (action == "SHUT_SOLENOID" || action == "TRIP_RELAY") {
+        tripped = true;
+        safetyStatus = (action == "TRIP_RELAY") ? String(doc["status"] | "GAS_LEAK")
+                                                : String("HAZARD_SHUTOFF");
+        setRelay(false);
+        digitalWrite(BUZZER_PIN, HIGH);
+        Serial.println("Hazard cutoff: main supply opened (" + safetyStatus + ")");
+    } else if (action == "BUZZER_ALERT") {
+        digitalWrite(BUZZER_PIN, HIGH);
+        safetyStatus = "HAZARD_WARNING";
+    } else if (action == "RELAY_ON") {
+        if (!tripped) setRelay(true);
+        else Serial.println("Refusing to close the relay while tripped - reset safety first.");
+    } else if (action == "RELAY_OFF") {
+        setRelay(false);
+    }
+}
+
+// The gateway's own telemetry. Unlike the subnodes this carries real measured
+// voltage, active power and power factor, because it is the only node with a
+// voltage reference - so the backend's cost figures come from here.
+void publishTelemetry(const MtReading& r) {
+    char payload[400];
+    snprintf(payload, sizeof(payload),
+        "{\"action\":\"TELEMETRY\",\"mac\":\"%s\",\"mesh_id\":\"%s\","
+        "\"role\":\"gateway\",\"gas\":0,\"current\":%.3f,\"voltage\":%.1f,"
+        "\"power\":%.1f,\"apparent_power\":%.1f,\"power_factor\":%.3f,"
+        "\"frequency\":%.1f,\"energy_wh\":%.3f,\"pir\":1,\"flame\":1,"
+        "\"status\":\"%s\"}",
+        meshMac().c_str(), meshCurrentId().c_str(),
+        r.iRms, r.vRms, r.activePower, r.apparentPower, r.powerFactor,
+        r.frequency, (float)energy.wattHours, safetyStatus.c_str());
+    if (meshPublishTelemetry(payload)) {
+        Serial.printf("Published %.1f W, PF %.2f, %.3f Wh\n",
+                      r.activePower, r.powerFactor, energy.wattHours);
+    }
+}
+
+void printNetworkStatus() {
+    Serial.println();
+    Serial.printf("  wi-fi     %s", WiFi.status() == WL_CONNECTED ? "connected" : "DISCONNECTED");
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("   ssid %s   ip %s   channel %d   rssi %d dBm",
+                      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+                      WiFi.channel(), WiFi.RSSI());
+    }
+    Serial.println();
+    Serial.printf("  mqtt      %s\n", meshOnline() ? "connected" : "DISCONNECTED");
+    Serial.printf("  mesh id   %s\n", meshCurrentId().length() ? meshCurrentId().c_str()
+                                                               : "(not paired - use the setup portal)");
+    Serial.printf("  mac       %s\n", meshMac().c_str());
+    Serial.printf("  safety    %s%s\n\n", safetyStatus.c_str(), tripped ? "  [TRIPPED]" : "");
+}
+
 void printHelp() {
     Serial.println();
     Serial.println("  n              measure the noise floor (nothing drawing)");
@@ -139,6 +221,8 @@ void printHelp() {
     Serial.println("  calv <volts>   calibrate voltage against a multimeter");
     Serial.println("  calw <watts>   calibrate current against a known resistive load");
     Serial.println("  cal            show the full calibration procedure");
+    Serial.println("  net            wi-fi, mqtt and mesh status");
+    Serial.println("  forget         wipe wi-fi and mesh credentials, then restart");
     Serial.println();
 }
 
@@ -151,6 +235,7 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
     pinMode(STATUS_LED, OUTPUT);
+    pinMode(RESET_PIN, INPUT_PULLUP);
 
     Serial.begin(115200);
     delay(600);
@@ -167,6 +252,10 @@ void setup() {
     Serial.printf("Sampling %d pairs/s, %d cycles per window\n", MT_SAMPLE_PAIRS, MT_CYCLES);
     Serial.printf("Calibration: MT_VOLT_CAL %.4f, MT_CURR_CAL %.5f\n", MT_VOLT_CAL, MT_CURR_CAL);
     Serial.println("Relay is OPEN. Start with 'cal' if this is a fresh build.");
+
+    // Brings up Wi-Fi (captive portal on first boot), ESP-NOW and MQTT. Blocks
+    // for up to the portal timeout if there is no saved network.
+    meshBegin();
     printHelp();
 }
 
@@ -208,9 +297,35 @@ void loop() {
             calibrateVoltage(lower.substring(5).toFloat());
         } else if (lower.startsWith("calw ")) {
             calibrateCurrent(lower.substring(5).toFloat());
+        } else if (lower == "net") {
+            printNetworkStatus();
+        } else if (lower == "forget") {
+            Serial.println("Wiping wi-fi and mesh credentials...");
+            meshFactoryReset();
         } else {
             Serial.printf("Unknown command: %s   (? for help)\n", line.c_str());
         }
+    }
+
+    meshLoop();
+
+    // Periodic telemetry to the backend, independent of the serial stream.
+    if (millis() - lastTelemetryPublish > telemetryIntervalMs) {
+        lastTelemetryPublish = millis();
+        MtReading r = mtMeasure(VOLTAGE_PIN, CURRENT_PIN);
+        mtAccumulate(energy, r);
+
+        // Checked on every measurement, not only when online - protection that
+        // depends on the network is not protection.
+        if (r.valid && r.iRms > OVERCURRENT_AMPS && !tripped) {
+            tripped = true;
+            safetyStatus = "OVERCURRENT_TRIP";
+            setRelay(false);
+            Serial.printf("OVERCURRENT: %.2f A exceeded %.1f A - supply opened\n",
+                          r.iRms, OVERCURRENT_AMPS);
+        }
+
+        if (meshOnline()) publishTelemetry(r);
     }
 
     if (streaming && millis() - lastStream > 1000) {
