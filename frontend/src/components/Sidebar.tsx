@@ -56,7 +56,7 @@ export const Sidebar = ({
         { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
         { id: 'zones', label: 'Energy Zones', icon: Zap, badge: zonesCount },
         { id: 'analytics', label: 'Analytics', icon: TrendingUp },
-        { id: 'digital-twin', label: 'Digital Twin', icon: Box },
+        { id: 'room-architect', label: 'Room Architect', icon: Box },
       ],
     },
     {

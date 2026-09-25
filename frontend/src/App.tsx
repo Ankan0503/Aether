@@ -49,7 +49,9 @@ import { sendHazardNotification, showImmediateHazardNotification } from './servi
 // Import refactored hook
 import { useAudioAlert } from './hooks/useAudioAlert';
 
-const DigitalTwinView = lazy(() => import('./components/DigitalTwinView').then(module => ({ default: module.DigitalTwinView })));
+// Room Architect replaces the old three.js Digital Twin. Still lazy-loaded:
+// it is the largest view in the app and most sessions never open it.
+const RoomArchitectView = lazy(() => import('./components/RoomArchitectView'));
 const HAZARD_ALERT_RESET_MS = 10000;
 
 // --- Mock Data ---
@@ -1258,16 +1260,15 @@ export default function App() {
             />
           )}
 
-          {activeView === 'digital-twin' && (
+          {activeView === 'room-architect' && (
             <Suspense fallback={
               <div className="min-h-[420px] rounded-[2.5rem] bg-white border border-olive/10 flex items-center justify-center text-sm font-bold text-olive">
-                Loading digital twin...
+                Loading room architect...
               </div>
             }>
-              <DigitalTwinView
-                token={token}
-                meshId={meshId}
-                liveTelemetry={liveTelemetry}
+              <RoomArchitectView
+                zones={zones}
+                onToggleZone={toggleZone}
                 addToast={addToast}
               />
             </Suspense>
