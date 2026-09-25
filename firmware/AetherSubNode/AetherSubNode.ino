@@ -1,16 +1,25 @@
 // ============================================================================
-// Aether Automation SubNode - three switched sockets, load identification and
-// occupancy-based cutoff.
+// Aether SubNode - one sketch, two roles. Pick one before flashing.
 //
-// This is the node already wired on the bench. It does three things:
-//   1. switches three mains sockets
-//   2. works out WHAT is plugged into each one, from current waveform shape
-//   3. opens a socket that is drawing with nobody in the room
+//   DEVICE_TYPE_AUTOMATION  three switched sockets, load identification from
+//                           waveform shape, and occupancy-based cutoff.
 //
-// Still deliberately standalone - no Wi-Fi, ESP-NOW or MQTT. The cutoff rule
-// has to behave correctly against real loads before networking hides it behind
-// a dashboard, and the same bench-first approach is what caught the sensor and
-// averaging faults earlier.
+//   DEVICE_TYPE_KITCHEN     gas and flame sensing with a local buzzer, and a
+//                           peer-to-peer emergency trip that opens every relay
+//                           on the mesh without involving the gateway.
+//
+// Both roles share the mesh layer, the pairing flow and the serial console;
+// only the sensing and acting differ. Same structure as the original Aether
+// subnode, so a node can be reflashed between roles without rewiring anything
+// but its sensors.
+//
+// Networking is in Mesh.h: ESP-NOW only, never Wi-Fi. The node discovers the
+// gateway, is paired from the dashboard, then publishes telemetry and load
+// signatures through it. Every serial command still works, so the rule can be
+// watched directly rather than through a dashboard.
+//
+// The cutoff runs locally and does not need the gateway: a room keeps managing
+// its own sockets with the internet down.
 //
 // Pins - see firmware/PINOUT.md:
 //   Socket 1  relay GPIO 18 (IN1)   current GPIO 32
@@ -32,31 +41,87 @@
 //   idle <seconds>     shorter delay for a load that is only idling
 //   pir                live PIR state and time since motion
 //   n <1-3>            measure a channel's noise floor
+//   net                pairing and gateway status
+//   unpair             forget the mesh credentials
 //   ?                  help
 // ============================================================================
 
+// ==========================================================================
+// ROLE SWITCH - uncomment exactly one, then flash.
+// ==========================================================================
+// #define DEVICE_TYPE_KITCHEN
+#define DEVICE_TYPE_AUTOMATION
+
+#if defined(DEVICE_TYPE_KITCHEN) && defined(DEVICE_TYPE_AUTOMATION)
+#error "Pick one role: a node is either the kitchen sensor or the socket relay."
+#endif
+#if !defined(DEVICE_TYPE_KITCHEN) && !defined(DEVICE_TYPE_AUTOMATION)
+#error "No role selected - uncomment DEVICE_TYPE_KITCHEN or DEVICE_TYPE_AUTOMATION."
+#endif
+
 #include "Waveform.h"
 #include "Occupancy.h"
+#include "Mesh.h"
 
+const int STATUS_LED = 2;
+const int RESET_PIN  = 0;    // onboard BOOT button - hold 5s to unpair
+
+#ifdef DEVICE_TYPE_AUTOMATION
+const char* NODE_ROLE = "relay";
 const int RELAY_PINS[OCC_SOCKETS]   = {18, 22, 21};
 const int CURRENT_PINS[OCC_SOCKETS] = {32, 35, 34};
 const int PIR_PIN    = 19;
-const int STATUS_LED = 2;
 
 const int RELAY_ON  = LOW;    // relay board is active LOW
 const int RELAY_OFF = HIGH;
+#endif
 
+#ifdef DEVICE_TYPE_KITCHEN
+const char* NODE_ROLE = "sensor";
+const int GAS_PIN   = 35;   // MQ-2 analog out, ADC1
+const int FLAME_PIN = 32;   // IR flame module digital out - LOW means fire
+const int BUZZER_PIN = 25;
+
+// Above this the MQ-2 is reporting gas. Calibrate against clean air: note the
+// resting reading and set this well clear of it, or cooking steam will trip it.
+int gasThreshold = 3500;
+
+// Buzzer tones. Fire gets the higher, more piercing one so the two hazards are
+// distinguishable from another room without looking at anything.
+const int TONE_FIRE = 3500;
+const int TONE_GAS  = 2200;
+
+bool hadEmergency = false;
+unsigned long lastTripSent = 0;
+String hazardStatus = "SAFE";
+#endif
+
+#ifdef DEVICE_TYPE_AUTOMATION
 OccupancyState room;
 SocketState sockets[OCC_SOCKETS];
 CutoffConfig config;
+#endif
 
+#ifdef DEVICE_TYPE_AUTOMATION
 int scanChannel = 0;
 unsigned long lastScan = 0;
+unsigned long lastTelemetry = 0;
+unsigned long lastSignature = 0;
+int signatureChannel = 0;
+const unsigned long telemetryIntervalMs = 2000;
+const unsigned long signatureIntervalMs = 15000;
 unsigned long lastEvaluate = 0;
 unsigned long lastAccumulate = 0;
 const unsigned long scanIntervalMs = 3000;      // one socket measured every 3s
 const unsigned long evaluateIntervalMs = 1000;
+#endif
 
+#ifdef DEVICE_TYPE_KITCHEN
+unsigned long lastTelemetry = 0;
+const unsigned long telemetryIntervalMs = 2000;
+#endif
+
+#ifdef DEVICE_TYPE_AUTOMATION
 void setRelay(int index, bool closed, bool byRule) {
     if (index < 0 || index >= OCC_SOCKETS) return;
     digitalWrite(RELAY_PINS[index], closed ? RELAY_ON : RELAY_OFF);
@@ -171,8 +236,196 @@ void evaluateCutoff() {
     }
 }
 
+#endif  // DEVICE_TYPE_AUTOMATION - sockets, identification and cutoff
+
+// Called by Mesh.h for commands addressed to this node.
+void meshHandleCommand(const String& action, JsonDocument& doc) {
+#ifdef DEVICE_TYPE_KITCHEN
+    if (action == "RESET_SAFETY") {
+        hadEmergency = false;
+        hazardStatus = "SAFE";
+        ledcWrite(BUZZER_PIN, 0);
+        Serial.println("Hazard cleared from the dashboard - alarm muted.");
+    } else if (action == "SET_GAS_THRESHOLD") {
+        gasThreshold = doc["value"] | gasThreshold;
+        Serial.printf("Gas threshold set to %d\n", gasThreshold);
+    } else if (action == "BUZZER_TEST") {
+        ledcWriteTone(BUZZER_PIN, TONE_GAS);
+        delay(400);
+        ledcWrite(BUZZER_PIN, 0);
+    }
+    return;
+#else
+    if (action == "RELAY_ON" || action == "RELAY_OFF") {
+        const int socket = doc["channel"] | doc["socket_id"] | 0;
+        if (socket >= 1 && socket <= OCC_SOCKETS) {
+            setRelay(socket - 1, action == "RELAY_ON", false);
+        }
+    } else if (action == "TRIP_RELAY") {
+        // A gas or fire trip from the kitchen node. Everything off, now.
+        // This arrives peer-to-peer over ESP-NOW, so it works with the gateway
+        // and the internet both down - which is the point.
+        Serial.println("EMERGENCY TRIP from the safety node - opening every socket");
+        for (int i = 0; i < OCC_SOCKETS; i++) setRelay(i, false, false);
+    } else if (action == "SET_GRACE") {
+        config.graceSeconds = (uint32_t)(doc["seconds"] | (int)config.graceSeconds);
+    } else if (action == "ARM_CUTOFF") {
+        config.enabled = doc["enabled"] | true;
+        Serial.printf("Cutoff %s from the dashboard\n", config.enabled ? "armed" : "disarmed");
+    }
+#endif
+}
+
+#ifdef DEVICE_TYPE_KITCHEN
+// The whole point of this node. Gas or flame opens every relay on the mesh by
+// broadcasting straight to the other subnodes - no gateway, no Wi-Fi, no
+// internet. Most smart-home projects stop working when the router does; this
+// path is exactly the one that must not.
+void handleHazards() {
+    const int flameState = digitalRead(FLAME_PIN);   // LOW means fire
+    const int gasValue = analogRead(GAS_PIN);
+    const bool emergency = (flameState == LOW) || (gasValue > gasThreshold);
+
+    hazardStatus = (flameState == LOW) ? "FIRE_EMERGENCY"
+                 : (gasValue > gasThreshold) ? "GAS_LEAK"
+                 : "SAFE";
+
+    if (!emergency) {
+        ledcWrite(BUZZER_PIN, 0);
+        hadEmergency = false;
+        return;
+    }
+
+    ledcWriteTone(BUZZER_PIN, hazardStatus == "FIRE_EMERGENCY" ? TONE_FIRE : TONE_GAS);
+
+    // Send on the transition, then repeat every 3s while the hazard lasts - a
+    // single broadcast can be missed, and a trip that did not arrive is the
+    // one failure this node exists to prevent.
+    const unsigned long now = millis();
+    if (hadEmergency && now - lastTripSent < 3000) return;
+    lastTripSent = now;
+    hadEmergency = true;
+
+    char payload[250];
+    snprintf(payload, sizeof(payload),
+        "{\"action\":\"TRIP_RELAY\",\"mac\":\"%s\",\"mesh_id\":\"%s\","
+        "\"status\":\"%s\",\"gas\":%d,\"current\":0,\"pir\":1,\"flame\":%d}",
+        meshMac().c_str(), meshCurrentId().c_str(),
+        hazardStatus.c_str(), gasValue, flameState);
+    meshBroadcast(payload);
+    Serial.println("EMERGENCY TRIP BROADCAST: " + hazardStatus);
+}
+
+void publishKitchenTelemetry() {
+    if (!meshIsPaired()) return;
+    const int flameState = digitalRead(FLAME_PIN);
+    const int gasValue = analogRead(GAS_PIN);
+
+    char payload[260];
+    snprintf(payload, sizeof(payload),
+        "{\"action\":\"TELEMETRY\",\"mac\":\"%s\",\"mesh_id\":\"%s\","
+        "\"role\":\"sensor\",\"gas\":%d,\"current\":0,\"pir\":1,\"flame\":%d,"
+        "\"status\":\"%s\"}",
+        meshMac().c_str(), meshCurrentId().c_str(),
+        gasValue, flameState, hazardStatus.c_str());
+    meshBroadcast(payload);
+}
+
+void printKitchenStatus() {
+    const int flameState = digitalRead(FLAME_PIN);
+    const int gasValue = analogRead(GAS_PIN);
+    Serial.println();
+    Serial.println("=====================================================================");
+    Serial.printf("  gas    %5d  (threshold %d)%s\n", gasValue, gasThreshold,
+                  gasValue > gasThreshold ? "   <-- OVER THRESHOLD" : "");
+    Serial.printf("  flame  %s\n", flameState == LOW ? "FIRE DETECTED" : "clear");
+    Serial.printf("  status %s\n", hazardStatus.c_str());
+    Serial.printf("  mesh   %s\n", meshIsPaired() ? meshCurrentId().c_str() : "not paired");
+    Serial.println("=====================================================================\n");
+}
+#endif
+
+#ifdef DEVICE_TYPE_AUTOMATION
+// Combined telemetry in the shape the backend already parses: c1/c2/c4 map to
+// sockets 1/2/3, since socket 3 runs through the relay board's channel 4.
+void publishTelemetry() {
+    if (!meshIsPaired()) return;
+    char payload[320];
+    snprintf(payload, sizeof(payload),
+        "{\"action\":\"TELEMETRY\",\"mac\":\"%s\",\"mesh_id\":\"%s\",\"role\":\"relay\","
+        "\"gas\":0,\"current\":%.3f,\"pir\":%d,\"flame\":1,\"status\":\"SAFE\","
+        "\"c1\":%.3f,\"c2\":%.3f,\"c3\":0.000,\"c4\":%.3f,"
+        "\"r1\":%d,\"r2\":%d,\"r4\":%d}",
+        meshMac().c_str(), meshCurrentId().c_str(),
+        sockets[0].currentAdc + sockets[1].currentAdc + sockets[2].currentAdc,
+        room.motionNow ? 1 : 0,
+        sockets[0].currentAdc, sockets[1].currentAdc, sockets[2].currentAdc,
+        sockets[0].relayClosed ? 1 : 0,
+        sockets[1].relayClosed ? 1 : 0,
+        sockets[2].relayClosed ? 1 : 0);
+    meshBroadcast(payload);
+}
+
+// One socket's load signature. Sent as its own frame rather than folded into
+// telemetry because the waveform alone is 88 base64 characters and ESP-NOW caps
+// a message at 250 bytes.
+void publishSignature(int index) {
+    if (!meshIsPaired() || !sockets[index].relayClosed) return;
+
+    WfSignature signature = wfCapture(CURRENT_PINS[index]);
+    sockets[index].currentAdc = signature.rmsAdc;
+    sockets[index].loadType = signature.valid ? signature.label : "NONE";
+    if (!signature.valid) return;
+
+    char payload[250];
+    const int written = wfBuildPayload(signature, index + 1, meshMac(), payload, sizeof(payload));
+    if (written > 0 && written < (int)sizeof(payload)) {
+        meshBroadcast(payload);
+        Serial.printf("Published socket %d signature: %s (crest %.2f)\n",
+                      index + 1, signature.label, signature.crest);
+    }
+}
+
+#endif  // DEVICE_TYPE_AUTOMATION publishers
+
+// Hold BOOT for five seconds to forget the mesh. A node that followed the
+// gateway onto a channel it can no longer reach has no other way back.
+void checkResetButton() {
+    if (digitalRead(RESET_PIN) != LOW) return;
+    unsigned long held = 0;
+    while (digitalRead(RESET_PIN) == LOW && held < 5000) {
+        delay(100);
+        held += 100;
+        if (held % 1000 == 0) Serial.printf("Unpair in %lus...\n", (5000 - held) / 1000);
+    }
+    if (held >= 5000) {
+        Serial.println("Unpair requested from the BOOT button.");
+        meshUnpair();
+    }
+}
+
+void printNetworkStatus() {
+    Serial.println();
+    Serial.printf("  mac        %s\n", meshMac().c_str());
+    Serial.printf("  paired     %s\n", meshIsPaired() ? meshCurrentId().c_str()
+                                                       : "no - broadcasting discovery");
+    Serial.printf("  channel    %d\n", meshCurrentChannel());
+    Serial.printf("  gateway    %s\n\n", meshGatewayAlive() ? "reachable"
+                                                             : "not heard from recently");
+}
+
 void printHelp() {
     Serial.println();
+#ifdef DEVICE_TYPE_KITCHEN
+    Serial.println("  s                gas, flame and hazard status");
+    Serial.println("  gas <value>      set the gas alert threshold");
+    Serial.println("  test             sound the buzzer briefly");
+    Serial.println("  clear            clear a latched hazard and mute the alarm");
+    Serial.println("  net              pairing and gateway status");
+    Serial.println("  unpair           forget the mesh credentials");
+    Serial.println();
+    return;
+#else
     Serial.println("  s                status of every socket and the room");
     Serial.println("  on <1-3>         close a socket");
     Serial.println("  off <1-3>        open a socket");
@@ -183,10 +436,37 @@ void printHelp() {
     Serial.println("  idle <seconds>   shorter delay for a load that is only idling");
     Serial.println("  pir              live PIR state");
     Serial.println("  n <1-3>          measure a channel's noise floor");
+    Serial.println("  net              pairing and gateway status");
+    Serial.println("  unpair           forget the mesh credentials");
     Serial.println();
+#endif
 }
 
 void setup() {
+    pinMode(STATUS_LED, OUTPUT);
+    pinMode(RESET_PIN, INPUT_PULLUP);
+    Serial.begin(115200);
+    delay(600);
+    analogReadResolution(12);
+
+#ifdef DEVICE_TYPE_KITCHEN
+    pinMode(FLAME_PIN, INPUT_PULLUP);
+    pinMode(GAS_PIN, INPUT);
+    analogSetPinAttenuation(GAS_PIN, ADC_11db);
+    ledcAttach(BUZZER_PIN, 2000, 8);
+    ledcWrite(BUZZER_PIN, 0);
+
+    Serial.println("\n\n=== Aether Kitchen Safety SubNode ===");
+    Serial.printf("Gas on GPIO %d, flame on GPIO %d, buzzer on GPIO %d\n",
+                  GAS_PIN, FLAME_PIN, BUZZER_PIN);
+    Serial.printf("Gas threshold %d - calibrate it against clean air before trusting it.\n",
+                  gasThreshold);
+    Serial.println("A hazard trips every relay on the mesh directly, without the gateway.");
+
+    meshBegin(NODE_ROLE);
+    printHelp();
+}
+#else
     // HIGH before pinMode: an ESP32 GPIO is an input on reset, so an active-LOW
     // relay board would otherwise click every socket on during boot.
     for (int i = 0; i < OCC_SOCKETS; i++) {
@@ -194,14 +474,9 @@ void setup() {
         pinMode(RELAY_PINS[i], OUTPUT);
         digitalWrite(RELAY_PINS[i], RELAY_OFF);
     }
-    pinMode(STATUS_LED, OUTPUT);
     pinMode(PIR_PIN, INPUT);
     occBegin(room);
 
-    Serial.begin(115200);
-    delay(600);
-
-    analogReadResolution(12);
     for (int i = 0; i < OCC_SOCKETS; i++) {
         pinMode(CURRENT_PINS[i], INPUT);
         analogSetPinAttenuation(CURRENT_PINS[i], ADC_11db);
@@ -213,10 +488,46 @@ void setup() {
                   CURRENT_PINS[0], CURRENT_PINS[1], CURRENT_PINS[2]);
     Serial.printf("PIR on GPIO %d. All sockets open.\n", PIR_PIN);
     Serial.println("Cutoff is DISARMED until you type 'arm'.");
+
+    meshBegin(NODE_ROLE);
     printHelp();
 }
+#endif  // role-specific setup
 
 void loop() {
+    checkResetButton();
+
+#ifdef DEVICE_TYPE_KITCHEN
+    meshLoop(NODE_ROLE);
+    handleHazards();
+
+    if (millis() - lastTelemetry > telemetryIntervalMs) {
+        lastTelemetry = millis();
+        publishKitchenTelemetry();
+    }
+
+    if (Serial.available()) {
+        String line = Serial.readStringUntil('\n');
+        line.trim();
+        String lower = line;
+        lower.toLowerCase();
+
+        if (lower == "?" || lower == "help") printHelp();
+        else if (lower == "s" || lower == "status") printKitchenStatus();
+        else if (lower == "net") printNetworkStatus();
+        else if (lower == "unpair") meshUnpair();
+        else if (lower == "test") { ledcWriteTone(BUZZER_PIN, TONE_GAS); delay(400); ledcWrite(BUZZER_PIN, 0); }
+        else if (lower == "clear") { hadEmergency = false; hazardStatus = "SAFE"; ledcWrite(BUZZER_PIN, 0);
+                                     Serial.println("Hazard cleared."); }
+        else if (lower.startsWith("gas ")) { gasThreshold = lower.substring(4).toInt();
+                                             Serial.printf("Gas threshold %d\n", gasThreshold); }
+        else if (lower.length()) Serial.printf("Unknown command: %s   (? for help)\n", line.c_str());
+    }
+
+    // Solid while a hazard is latched, slow blink when clear.
+    digitalWrite(STATUS_LED, hazardStatus != "SAFE" ? HIGH : ((millis() / 1000) % 2));
+    return;
+#else
     occUpdate(room, PIR_PIN);
 
     if (Serial.available()) {
@@ -262,6 +573,10 @@ void loop() {
                                                     (unsigned long)quiet);
             else Serial.printf("Last motion %lus ago, %lu events.\n",
                                (unsigned long)quiet, (unsigned long)room.motionEvents);
+        } else if (lower == "net") {
+            printNetworkStatus();
+        } else if (lower == "unpair") {
+            meshUnpair();
         } else if (lower.startsWith("n ")) {
             int index = lower.substring(2).toInt() - 1;
             if (index >= 0 && index < OCC_SOCKETS) {
@@ -273,6 +588,22 @@ void loop() {
         } else {
             Serial.printf("Unknown command: %s   (? for help)\n", line.c_str());
         }
+    }
+
+    meshLoop("relay");
+
+    if (millis() - lastTelemetry > telemetryIntervalMs) {
+        lastTelemetry = millis();
+        publishTelemetry();
+    }
+
+    // Load signatures go out far less often than telemetry: the shape of a load
+    // changes only when the device does, and each capture costs 320ms of
+    // sampling that the safety path should not wait behind.
+    if (millis() - lastSignature > signatureIntervalMs) {
+        lastSignature = millis();
+        publishSignature(signatureChannel);
+        signatureChannel = (signatureChannel + 1) % OCC_SOCKETS;
     }
 
     // Round-robin measurement. One socket per sweep so a capture - 320ms of
@@ -297,4 +628,5 @@ void loop() {
 
     // Solid while someone is present, slow blink when the room is empty.
     digitalWrite(STATUS_LED, room.motionNow ? HIGH : ((millis() / 1000) % 2));
+#endif
 }
