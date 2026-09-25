@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="AETHER">
+  <defs>
+    <linearGradient id="bg" x1="82" y1="56" x2="430" y2="412" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3c4f1f"/>
+      <stop offset="1" stop-color="#657a35"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity=".24"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" fill="#222"/>
+  <rect x="66" y="42" width="380" height="300" rx="68" fill="url(#bg)" filter="url(#soft)"/>
+  <g fill="none" stroke="#f3efd5" stroke-linecap="round" stroke-width="31">
+    <path d="M152 129c59-57 149-57 208 0"/>
+    <path d="M184 176c41-38 103-38 144 0"/>
+  </g>
+  <path fill="#f3efd5" d="M236 170h40l8 39c10 4 19 9 27 16l38-12 20 35-30 27c1 5 2 11 2 16s-1 11-2 16l30 27-20 35-38-12c-8 7-17 12-27 16l-8 39h-40l-8-39c-10-4-19-9-27-16l-38 12-20-35 30-27c-1-5-2-11-2-16s1-11 2-16l-30-27 20-35 38 12c8-7 17-12 27-16l8-39Z"/>
+  <circle cx="256" cy="291" r="52" fill="#51662b"/>
+  <circle cx="256" cy="291" r="30" fill="#f3efd5"/>
+  <circle cx="256" cy="291" r="13" fill="#51662b"/>
+  <text x="256" y="455" text-anchor="middle" font-family="Arial Black, Arial, sans-serif" font-size="84" font-weight="900" letter-spacing="6" fill="#435524">AETHER</text>
+</svg>
+
