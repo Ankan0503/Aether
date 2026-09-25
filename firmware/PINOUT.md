@@ -111,7 +111,9 @@ actually in use is never cut regardless of what the PIR thinks.
 
 ## 3. Kitchen safety subnode — gas and fire
 
-Not built yet.
+Firmware exists: it is the same `AetherSubNode` sketch with
+`DEVICE_TYPE_KITCHEN` selected instead of `DEVICE_TYPE_AUTOMATION`. The
+hardware is not wired yet.
 
 | Function | GPIO | Type | Notes |
 |---|---|---|---|
@@ -125,8 +127,14 @@ No PIR on this node — occupancy is handled by the automation subnode, in the
 room where the sockets it controls actually are.
 
 This node's critical path does not involve the internet: on gas or flame it
-broadcasts a trip directly to the relay subnode over ESP-NOW, so cutoff still
-works with Wi-Fi down.
+broadcasts `TRIP_RELAY` straight to the relay subnode over ESP-NOW, so cutoff
+still works with Wi-Fi down. The trip repeats every 3 seconds while the hazard
+lasts, because a single broadcast can be missed and an undelivered trip is the
+one failure this node exists to prevent.
+
+The MQ-2 threshold must be calibrated against clean air before it is trusted -
+note the resting reading and set `gasThreshold` well clear of it, or cooking
+steam will trip the alarm.
 
 ---
 
