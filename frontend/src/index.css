@@ -1,0 +1,109 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Helvetica Neue", Arial, "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", "Helvetica Neue", sans-serif;
+  
+  --color-bg-base: #FDFBF7;
+  --color-bg-card: #F2E8D5;
+  --color-sage: #8FA189;
+  --color-clay: #D4A373;
+  --color-olive: #606C38;
+  --color-ink: #3E423A;
+  
+  --color-primary: #606C38; /* olive */
+  --color-secondary: #8FA189; /* sage */
+  --color-accent: #D4A373; /* clay */
+  --color-danger: #bc4749; /* softer red */
+  --color-caution: #D4A373; /* clay for caution */
+}
+
+@layer base {
+  html {
+    min-height: 100%;
+    background: var(--color-bg-base);
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-bg-base text-ink font-sans;
+    min-height: 100%;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  #root {
+    min-height: 100dvh;
+  }
+  
+  h1, h2, h3, h4 {
+    @apply font-display tracking-tight text-ink;
+  }
+
+  button,
+  a,
+  input,
+  select,
+  textarea {
+    touch-action: manipulation;
+  }
+
+  button,
+  [role="button"] {
+    min-height: 44px;
+  }
+}
+
+@supports (padding: max(0px)) {
+  .safe-bottom {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+
+  .safe-top {
+    padding-top: max(0rem, env(safe-area-inset-top));
+  }
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.touch-pan-x {
+  touch-action: pan-x;
+}
+
+.natural-bg {
+  background-color: var(--color-bg-base);
+  background-image: 
+    radial-gradient(circle at 2px 2px, rgba(96, 108, 56, 0.03) 1px, transparent 0);
+  background-size: 32px 32px;
+}
+
+.soft-shadow {
+  box-shadow: 0 10px 40px rgba(62, 66, 58, 0.05);
+}
+
+.text-soft-glow {
+  text-shadow: 0 0 15px rgba(143, 161, 137, 0.2);
+}
+
+.hazard-warning {
+  animation: hazard-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes hazard-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(188, 71, 73, 0.22), 0 10px 40px rgba(62, 66, 58, 0.05);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(188, 71, 73, 0.08), 0 18px 52px rgba(188, 71, 73, 0.14);
+  }
+}
+
