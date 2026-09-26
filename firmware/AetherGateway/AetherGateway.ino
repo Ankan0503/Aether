@@ -235,6 +235,7 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
     pinMode(STATUS_LED, OUTPUT);
+    digitalWrite(STATUS_LED, LOW);   // gateway LED stays dark
     pinMode(RESET_PIN, INPUT_PULLUP);
 
     Serial.begin(115200);
@@ -337,5 +338,9 @@ void loop() {
                       r.frequency, energy.wattHours, mtLoadCharacter(r));
     }
 
-    digitalWrite(STATUS_LED, relayClosed);
+    // The gateway deliberately leaves its LED dark. It is a fixed box at the
+    // meter - you are not standing over it reading a blink pattern, and its
+    // state is better seen through `net` on serial or the dashboard. The blue
+    // LED is reserved for the subnodes, which are the things you move around
+    // and need feedback from while pairing.
 }

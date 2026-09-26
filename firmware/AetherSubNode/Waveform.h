@@ -44,6 +44,55 @@
 // The default 6.0 was a guess and would have thrown away small real loads.
 #define WF_NOISE_FLOOR_ADC 3.0f
 
+// ---------------------------------------------------------------------------
+// ADC RMS counts -> amps.
+//
+// This was missing, and its absence went straight to the dashboard: the subnode
+// put raw counts in the telemetry `current` field and the backend multiplied
+// that by 230 V, so an EMPTY socket reported its own noise floor as ~530 W and
+// a 100 W bulb came out at 8.8 kW.
+//
+// ACS712-30A is 66 mV/A. The ESP32 ADC at 11dB attenuation spans ~3.3 V over
+// 4095 counts, so 4095/3.3 = 1241 counts/V, and
+//     0.066 V/A * 1241 counts/V = 81.9 counts per amp RMS.
+//
+// Checked against the rig rather than trusted: the 100 W filament bulb measured
+// 38.3 ADC RMS, which is 38.3/81.9 = 0.468 A = 107.6 W at 230 V. A filament
+// bulb's hot resistance puts it slightly over nominal on a 230 V+ supply, so
+// agreement to a few percent is what we should see, and is what we get.
+//
+// This scales magnitude only. Every shape feature is computed after normalising
+// by the waveform's own RMS, so classification is unaffected either way.
+#define WF_ADC_COUNTS_PER_AMP 81.9f
+
+// The ADC spans 0-4095 centred near 2048, so the largest RMS a real sinusoid can
+// produce is 2048/sqrt(2) = 1448 counts. A reading above that is not a large
+// load, it is a clipped or floating input - a disconnected ACS712 output reads
+// exactly like this, swinging across the whole range with a garbage shape.
+//
+// Observed on the rig: channel 1 read 1924 ADC RMS with its relay commanded
+// open, which would have been published as 23.5 A and put over 5 kW of phantom
+// consumption on every chart. The bound is arithmetic, not a tuned threshold.
+#define WF_ADC_MAX_CREDIBLE_RMS 1448.0f
+
+inline bool wfAdcCredible(float rmsAdc) {
+    return rmsAdc <= WF_ADC_MAX_CREDIBLE_RMS;
+}
+
+// Counts to amps for publishing. Two readings become zero:
+//
+//   below the noise floor - not a small load, nothing at all. Reporting the
+//   floor as current is what put ~530 W on a socket with an open relay.
+//
+//   above what the ADC can represent - a sensor fault, not a load. Zero is the
+//   honest number for a channel that cannot be measured; the fault itself is
+//   reported separately rather than buried in a wattage.
+inline float wfAdcToAmps(float rmsAdc) {
+    if (rmsAdc < WF_NOISE_FLOOR_ADC) return 0.0f;
+    if (!wfAdcCredible(rmsAdc)) return 0.0f;
+    return rmsAdc / WF_ADC_COUNTS_PER_AMP;
+}
+
 // Classification labels
 #define WF_CLASS_NONE      "NONE"        // below noise floor - nothing drawing
 #define WF_CLASS_RESISTIVE "RESISTIVE"   // filament/halogen bulb, heater, iron
@@ -229,7 +278,7 @@ inline int wfBase64(const int8_t* in, int len, char* out, int outSize) {
     return o;
 }
 
-inline int wfBuildPayload(const WfSignature& sig, int channel, const String& mac,
+inline int wfBuildPayload(const WfSignature& sig, int channel, const String& mac, const String& meshId,
                           char* out, size_t outSize) {
     float peak = 0;
     for (int n = 0; n < WF_BINS; n++) if (fabsf(sig.cycle[n]) > peak) peak = fabsf(sig.cycle[n]);
@@ -243,12 +292,19 @@ inline int wfBuildPayload(const WfSignature& sig, int channel, const String& mac
     char b64[96];
     wfBase64(q, WF_BINS, b64, sizeof(b64));
 
+    // mesh_id is REQUIRED: the gateway drops any frame whose mesh_id does not
+    // match its own, so a WF frame without one was silently discarded and the
+    // dashboard showed "no waveform captured" forever.
+    //
+    // It only fits because the six shape features this used to send are dead
+    // weight. The backend recomputes crest, form factor, conduction, THD and
+    // the harmonics from "w" and explicitly does not trust the on-device
+    // numbers over its own, so transmitting them bought nothing and cost the
+    // ~30 bytes that mesh_id needs. "cls" stays: the server keeps it to
+    // compare its verdict against the node's.
     return snprintf(out, outSize,
-        "{\"action\":\"WF\",\"mac\":\"%s\",\"ch\":%d,\"rms\":%.1f,\"cr\":%.2f,"
-        "\"ff\":%.2f,\"cd\":%.2f,\"thd\":%.2f,\"h3\":%.2f,\"h5\":%.2f,"
-        "\"cls\":\"%s\",\"w\":\"%s\"}",
-        mac.c_str(), channel, sig.rmsAdc, sig.crest, sig.formFactor,
-        sig.conduction, sig.thd, sig.h3, sig.h5, sig.label, b64);
+        "{\"action\":\"WF\",\"mac\":\"%s\",\"mesh_id\":\"%s\",\"ch\":%d,\"rms\":%.1f,\"cls\":\"%s\",\"w\":\"%s\"}",
+        mac.c_str(), meshId.c_str(), channel, sig.rmsAdc, sig.label, b64);
 }
 
 #endif  // AETHER_WAVEFORM_H

@@ -380,7 +380,8 @@ def reset_safety(request):
 
         reset_payload = {
             "mac": mac_address,
-            "action": "RESET_SAFETY"
+            "action": "RESET_SAFETY",
+            "mesh_id": get_or_create_user_profile(user).mesh_id
         }
         
         try:
@@ -533,9 +534,15 @@ def toggle_appliance(request):
             import ssl
             tls = {'ca_certs': None, 'cert_reqs': ssl.CERT_NONE, 'tls_version': ssl.PROTOCOL_TLS}
 
+        from accounts.views import get_or_create_user_profile
+
         control_payload = {
             "mac": appliance.device.mac_address,
             "action": "CONTROL_RELAY",
+            # Subnodes discard any command whose mesh_id is not their own.
+            # Without it the packet reaches the node over ESP-NOW and is
+            # dropped without a trace - which is exactly what was happening.
+            "mesh_id": get_or_create_user_profile(user).mesh_id,
             "channel": relay_channel_for_socket(appliance.channel),
             "state": active
         }

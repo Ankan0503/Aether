@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.http import JsonResponse
 from django.db.models import Q
 from django.views.decorators.http import require_GET
@@ -234,3 +235,144 @@ def load_signatures(request):
         })
 
     return JsonResponse({'sockets': sockets})
+
+
+@require_GET
+def socket_history(request):
+    """Per-socket energy history, served from the TimescaleDB continuous aggregate.
+
+    Query: ?range=daily|weekly|monthly&socket_id=N
+
+    Reads telemetry_socket_hourly rather than the raw table. The rollup is
+    maintained incrementally, so a month of history is a few hundred
+    pre-computed rows instead of a scan over millions - which is what lets a
+    time range redraw instantly rather than after a pause.
+
+    The aggregate stores time_weight() rather than a plain average, because
+    readings are written on change plus a heartbeat rather than at a fixed rate
+    (see store_policy.py). A plain avg() would be biased toward whichever state
+    produced more rows - measured at 75 W against a true 50 W on a load that ran
+    half an hour. average() and integral() over the weighted summary give the
+    honest watts and watt-hours.
+
+    When there is no data it returns an empty series and says why. It never
+    invents a curve: a chart that looks like evidence has to be evidence.
+    """
+    from django.db import connection
+
+    from accounts.views import get_user_from_jwt
+    from devices.models import Device
+
+    user = get_user_from_jwt(request)
+    if not user:
+        return JsonResponse({'error': 'Authentication required.'}, status=401)
+
+    # The aggregate buckets by the minute, so 'live' serves its rows directly and
+    # the wider ranges are date_trunc'd up from them. 'live' is what makes the
+    # chart fill within a couple of minutes of switching a socket on instead of
+    # staying blank until an hour has elapsed.
+    ranges = {
+        'live': ('60 minutes', 'minute', '%H:%M'),
+        'hourly': ('6 hours', 'minute', '%H:%M'),
+        'daily': ('1 day', 'hour', '%H:00'),
+        'weekly': ('7 days', 'day', '%a'),
+        'monthly': ('30 days', 'day', '%d %b'),
+        'yearly': ('365 days', 'month', '%b %Y'),
+    }
+    key = str(request.GET.get('range', 'live')).lower()
+    window, bucket, fmt = ranges.get(key, ranges['daily'])
+
+    macs = list(
+        Device.objects.filter(owner=user, is_paired=True)
+        .values_list('mac_address', flat=True)
+    )
+    if not macs:
+        return JsonResponse({'range': key, 'points': [], 'total_wh': 0.0,
+                             'note': 'No paired devices yet.'})
+
+    filters = ['device_id = ANY(%s)', f"bucket > now() - INTERVAL '{window}'"]
+    params = [macs]
+
+    socket_id = request.GET.get('socket_id')
+    if socket_id:
+        filters.append('socket_id = %s')
+        params.append(int(socket_id))
+    else:
+        # Ingestion stores a combined device reading (socket_id NULL) alongside
+        # one row per socket, so summing everything adds the total to its own
+        # parts - which is how this briefly reported an average above its own
+        # peak. The per-socket rows are what the zones represent, so those are
+        # the series that get summed.
+        filters.append('socket_id IS NOT NULL')
+
+    # Two stages, and the split is not cosmetic.
+    #
+    # rollup() recombines time-weighted summaries ALONG TIME, and it requires the
+    # summaries it is given to be non-overlapping. Within one (device, socket)
+    # series the minute buckets satisfy that, so a day can be rebuilt from its
+    # minutes without touching the raw readings - that is the whole point of the
+    # aggregate.
+    #
+    # Grouping several sockets into one slot does not satisfy it: those series run
+    # in PARALLEL, covering the same wall-clock minute, and the toolkit rejects it
+    # with OrderError rather than returning a quietly wrong number. It is right to
+    # refuse. Three sockets drawing at once is not one longer measurement, and
+    # time-weighting them together would mean nothing.
+    #
+    # So: roll up along time per series first, then sum across series. Total watts
+    # is the sum of each socket's watts, and total watt-hours the sum of each
+    # socket's energy, which is what the dashboard is actually claiming to show.
+    sql = f"""
+        WITH per_series AS (
+            SELECT date_trunc('{bucket}', bucket)      AS slot,
+                   device_id,
+                   socket_id,
+                   average(rollup(power_tw))           AS avg_w,
+                   integral(rollup(power_tw), 'hours') AS wh,
+                   max(peak_power)                     AS peak_w,
+                   sum(samples)                        AS samples
+            FROM telemetry_socket_hourly
+            WHERE {' AND '.join(filters)}
+            GROUP BY slot, device_id, socket_id
+        )
+        SELECT slot,
+               sum(avg_w)   AS avg_w,
+               sum(wh)      AS wh,
+               -- Upper bound: per-socket peaks need not have been simultaneous.
+               -- max() would understate the total and can fall below the mean,
+               -- which is worse than a bound that is honest about being one.
+               sum(peak_w)  AS peak_w,
+               sum(samples) AS samples
+        FROM per_series
+        GROUP BY slot
+        ORDER BY slot
+    """
+
+    points, total_wh = [], 0.0
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            for slot, avg_w, wh, peak_w, samples in cursor.fetchall():
+                watt_hours = float(wh or 0.0)
+                total_wh += watt_hours
+                points.append({
+                    'name': slot.strftime(fmt),
+                    'timestamp': slot.isoformat(),
+                    'value': round(float(avg_w or 0.0), 2),
+                    'watt_hours': round(watt_hours, 3),
+                    'peak': round(float(peak_w or 0.0), 2),
+                    'samples': int(samples or 0),
+                })
+    except Exception as exc:  # noqa: BLE001 - a cold aggregate must not 500
+        return JsonResponse({'range': key, 'points': [], 'total_wh': 0.0,
+                             'note': f'History not available yet: {exc}'})
+
+    tariff = float(getattr(settings, 'TARIFF_RUPEES_PER_KWH', 8.0))
+    return JsonResponse({
+        'range': key,
+        'bucket': bucket,
+        'points': points,
+        'total_wh': round(total_wh, 3),
+        'cost': round(total_wh / 1000.0 * tariff, 2),
+        'note': '' if points else 'No readings stored for this range yet.',
+    })

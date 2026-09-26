@@ -25,3 +25,11 @@ db.sqlite3
 
 # Matplotlib output from the bench tools.
 backend/captures/*.csv.bak
+
+# Firmware build artifacts
+firmware/**/build/
+firmware/**/out_kitchen/
+*.bin
+*.elf
+*.map
+

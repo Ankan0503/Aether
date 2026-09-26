@@ -2380,6 +2380,29 @@ export default function RoomArchitectView({
                     <span className="text-[9px] bg-emerald-100 text-emerald-800 font-mono px-1.5 py-0.5 rounded font-bold">WIRED OK</span>
                   </div>
 
+                  {/* Dropdown to re-attach or change ESP node for selected room */}
+                  <div>
+                    <label className="text-[9px] text-ink/40 font-mono uppercase block mb-1">Select & Attach ESP Node</label>
+                    <select
+                      value={selectedRoom.espId || ''}
+                      onChange={(e) => {
+                        const newEspId = e.target.value;
+                        setRooms(prev => prev.map(r => r.id === selectedRoom.id ? { ...r, espId: newEspId } : r));
+                        const targetEsp = esps.find(esp => esp.id === newEspId);
+                        appendLog(`MAP SIMULATOR: Attached ${targetEsp?.name || 'No Node'} to "${selectedRoom.name}"`);
+                        addAlert('ESP Reassigned', `Attached ${targetEsp?.name || 'None'} to ${selectedRoom.name}`, 'success');
+                      }}
+                      className="w-full bg-white border border-[#E4E0D2] rounded-xl px-3 py-2 text-xs font-bold text-[#3E423A] focus:ring-2 focus:ring-[#BF5AF2] outline-none cursor-pointer"
+                    >
+                      <option value="">-- No ESP Node Attached --</option>
+                      {esps.map(e => (
+                        <option key={e.id} value={e.id}>
+                          {e.name} ({e.ip})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
                   {/* ESP Module Info and interactive toggles */}
                   {esps.find(e => e.id === selectedRoom.espId) ? (
                     (() => {

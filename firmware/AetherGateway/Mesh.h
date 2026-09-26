@@ -72,6 +72,14 @@ static String meshKey = "";
 static unsigned long lastMqttRetry = 0;
 static unsigned long lastHeartbeat = 0;
 
+// A trip arrives on the ESP-NOW receive callback, which runs on the Wi-Fi task.
+// Publishing MQTT from there shares PubSubClient with the main loop, which is
+// not safe and can stall inside the radio callback - delaying the very cutoff
+// the message is about. The relay is opened immediately in the callback; the
+// report is queued here and sent from the loop a moment later.
+static char pendingTripReport[260] = {0};
+static volatile bool tripReportPending = false;
+
 static const uint8_t BROADCAST_ADDR[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // Implemented by the sketch: lets the gateway act on commands that concern its
@@ -202,9 +210,14 @@ inline void meshOnEspNow(const esp_now_recv_info* info, const uint8_t* data, int
         // A safety trip has already been actioned peer-to-peer by the subnodes
         // before this arrives. The gateway's job here is only to report it, and
         // to let the sketch cut its own main relay.
-        Serial.println("Emergency trip reported by " + nodeMac);
+        // Cut first, report second. Nothing between the packet arriving and
+        // the relay opening.
         meshHandleGatewayCommand("TRIP_RELAY", doc);
-        meshPublishTelemetry(json);
+        Serial.println("Emergency trip from " + nodeMac + " - relay opened");
+
+        strncpy(pendingTripReport, json, sizeof(pendingTripReport) - 1);
+        pendingTripReport[sizeof(pendingTripReport) - 1] = '\0';
+        tripReportPending = true;
     }
 }
 
@@ -290,6 +303,14 @@ inline void meshLoop() {
     if (WiFi.status() == WL_CONNECTED) {
         meshReconnect();
         mqttClient.loop();
+    }
+
+    // Send any trip report the radio callback queued. Done here so the publish
+    // happens on the main task, where PubSubClient is safe to touch.
+    if (tripReportPending) {
+        tripReportPending = false;
+        meshPublishTelemetry(pendingTripReport);
+        Serial.println("Trip reported to the backend");
     }
 
     const unsigned long now = millis();

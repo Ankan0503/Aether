@@ -28,6 +28,8 @@
 // ============================================================================
 
 #include <Arduino.h>
+#include <Preferences.h>
+#include <string.h>   // strcmp, for the load-type policy below
 
 #define OCC_SOCKETS 3
 
@@ -58,6 +60,9 @@ struct SocketState {
     // saving from the live reading would therefore always add nothing.
     float currentAtCutAdc = 0;
     float savedAdcSeconds = 0;     // crude integral of what was cut, see below
+    // Set when the socket draws current while commanded open - welded
+    // contacts. The socket cannot be switched off in that state.
+    bool contactsStuck = false;
 };
 
 struct CutoffConfig {
@@ -67,8 +72,38 @@ struct CutoffConfig {
     // Idling loads are cut sooner - nobody is mid-use of something that is
     // only trickling.
     uint32_t idleGraceSeconds = 60;
-    bool enabled = false;          // off until explicitly armed
+    // Armed by default. This was false for a while, and because it lived only
+    // in RAM the node came up disarmed after every reflash and every brownout -
+    // so the rule looked broken when it was merely switched off, silently. The
+    // three fields above have the same problem, so all three now persist.
+    bool enabled = true;
 };
+
+// ---------------------------------------------------------------------------
+// Persistence for the three fields above. Whatever the rule is set to should
+// survive a power cut, because a safety-adjacent rule that quietly forgets it
+// was enabled is worse than one that was never enabled at all: the dashboard
+// still claims it is watching.
+// ---------------------------------------------------------------------------
+static Preferences occPrefs;
+
+inline void occSaveConfig(const CutoffConfig& config) {
+    occPrefs.begin("cutoff", false);
+    occPrefs.putBool("enabled", config.enabled);
+    occPrefs.putUInt("grace", config.graceSeconds);
+    occPrefs.putUInt("idle", config.idleGraceSeconds);
+    occPrefs.end();
+}
+
+// Call from setup(), before the first occDecide(). Missing keys fall back to
+// the struct defaults, so a node flashed for the first time comes up armed.
+inline void occLoadConfig(CutoffConfig& config) {
+    occPrefs.begin("cutoff", true);
+    config.enabled         = occPrefs.getBool("enabled", config.enabled);
+    config.graceSeconds    = occPrefs.getUInt("grace",   config.graceSeconds);
+    config.idleGraceSeconds = occPrefs.getUInt("idle",   config.idleGraceSeconds);
+    occPrefs.end();
+}
 
 struct CutoffDecision {
     bool shouldCut = false;
@@ -143,18 +178,52 @@ inline CutoffDecision occEvaluate(const SocketState& socket,
     }
 
     const bool idling = socket.currentAdc < OCC_IDLE_BAND_ADC;
-    const uint32_t grace = idling ? config.idleGraceSeconds : config.graceSeconds;
     const uint32_t quiet = occSecondsSinceMotion(occupancy);
 
+    // What is plugged in decides whether an empty room means waste.
+    //
+    // Occupancy answers "is anyone here", which is the whole story for a light
+    // and almost none of it for a charger. A bulb burning in an empty room is
+    // waste by definition - nobody is seeing the light. A phone charging in an
+    // empty room is doing exactly its job, and cutting it because you left the
+    // room would make the system infuriating rather than useful.
+    //
+    // The load type comes from the current waveform, so this needs no setup and
+    // no labelling: move the bulb to another socket and the policy follows it.
+    const bool isLighting = socket.loadType && strcmp(socket.loadType, "RESISTIVE") == 0;
+    const bool isSupply   = socket.loadType && strcmp(socket.loadType, "SMPS") == 0;
+
+    uint32_t grace;
+    if (isLighting) {
+        // Serves the room, so an empty room is enough on its own.
+        grace = config.graceSeconds;
+    } else if (isSupply) {
+        // Only cut a switching supply once it has dropped to the idle band -
+        // that is a charger that has finished, not one still doing work.
+        if (!idling) {
+            decision.reason = "switching supply still drawing - charging, left alone";
+            return decision;
+        }
+        grace = config.idleGraceSeconds;
+    } else {
+        // MIXED, or not yet identified. Be conservative and treat it the way a
+        // supply is treated: require it to be idling before cutting anything.
+        if (!idling) {
+            decision.reason = "unidentified load still drawing - left alone";
+            return decision;
+        }
+        grace = config.idleGraceSeconds;
+    }
+
     if (quiet < grace) {
-        decision.reason = idling ? "idling, but room recently occupied"
-                                 : "in use, room recently occupied";
+        decision.reason = "room occupied recently";
         return decision;
     }
 
     decision.shouldCut = true;
-    decision.reason = idling ? "idling with nobody present"
-                             : "drawing with nobody present";
+    decision.reason = isLighting ? "light left on in an empty room"
+                    : isSupply   ? "supply finished charging, nobody present"
+                                 : "idle load, nobody present";
     return decision;
 }
 

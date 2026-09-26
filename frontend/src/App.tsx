@@ -52,16 +52,52 @@ import { useAudioAlert } from './hooks/useAudioAlert';
 // Room Architect replaces the old three.js Digital Twin. Still lazy-loaded:
 // it is the largest view in the app and most sessions never open it.
 const RoomArchitectView = lazy(() => import('./components/RoomArchitectView'));
+import { LiveWaveform } from './components/LiveWaveform';
 const HAZARD_ALERT_RESET_MS = 10000;
 
 // --- Mock Data ---
-const generateChartData = (range: string = 'Daily') => {
-  const points = range === 'Daily' ? 24 : range === 'Weekly' ? 7 : 30;
-  return Array.from({ length: points }, (_, i) => ({
-    name: range === 'Daily' ? `${i}:00` : range === 'Weekly' ? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][i] : `Day ${i + 1}`,
-    value: Math.floor(Math.random() * 400) + 100,
-    previous: Math.floor(Math.random() * 350) + 150,
-  }));
+// Real per-socket energy, from the TimescaleDB continuous aggregate. This used
+// to be Math.random(), which regenerated on every click - the same socket showed
+// a different history each time you opened it. A chart that looks like evidence
+// has to be evidence, so when there is nothing stored this returns an empty
+// series and the caller says so rather than drawing an invented curve.
+// The zone drawer says 'Daily', Analytics says 'Day'. Neither vocabulary was
+// the one the API speaks, so the Analytics tabs all quietly returned the
+// default range whatever you clicked. One map, both dialects.
+const RANGE_KEYS: Record<string, string> = {
+  live: 'live',
+  hour: 'hourly', hourly: 'hourly',
+  day: 'daily', daily: 'daily',
+  week: 'weekly', weekly: 'weekly',
+  month: 'monthly', monthly: 'monthly',
+  year: 'yearly', yearly: 'yearly',
+};
+
+const fetchChartData = async (
+  apiBaseUrl: string,
+  token: string | null,
+  range: string = 'Live',
+  socketId?: number,
+): Promise<{ points: any[]; note: string; totalWh: number; cost: number }> => {
+  if (!token) return { points: [], note: 'Sign in to view stored history.', totalWh: 0, cost: 0 };
+  const key = RANGE_KEYS[range.toLowerCase()] || 'live';
+  const params = new URLSearchParams({ range: key });
+  if (socketId) params.set('socket_id', String(socketId));
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/telemetry/history/?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return {
+      points: data.points || [],
+      note: data.note || '',
+      totalWh: data.total_wh || 0,
+      cost: data.cost || 0,
+    };
+  } catch (e: any) {
+    return { points: [], note: e.message || 'Could not reach the backend.', totalWh: 0, cost: 0 };
+  }
 };
 
 const mapApplianceToZone = (app: any) => {
@@ -80,6 +116,7 @@ const mapApplianceToZone = (app: any) => {
   return {
     id: `app-socket-${app.id}`,
     appliance_id: app.id,
+    channel: app.channel,
     name: app.name,
     type: app.type,
     icon: icon,
@@ -101,6 +138,8 @@ const mapApplianceToZone = (app: any) => {
 interface Zone {
   id: string;
   appliance_id?: number;
+  // Socket number on the relay node, needed to scope history to one socket.
+  channel?: number;
   name: string;
   type: string;
   icon: React.ComponentType<any>;
@@ -343,9 +382,12 @@ export default function App() {
     };
   }, [zones, isEcoMode]);
 
-  const [data, setData] = useState(generateChartData());
+  const [data, setData] = useState<any[]>([]);
+  const [chartNote, setChartNote] = useState<string>('');
 
   const apiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+
 
   const authHeaders = (withJson = true): HeadersInit => {
     const headers: HeadersInit = {};
@@ -404,12 +446,50 @@ export default function App() {
   }, [token]);
 
   const [selectedZone, setSelectedZone] = useState<null | typeof zones[0]>(null);
+
+
   const [analyticsRange, setAnalyticsRange] = useState('Week');
   const [aiSuggestions, setAiSuggestions] = useState<SmartRule[]>([]);
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [energyInsight, setEnergyInsight] = useState<EnergyInsight | null>(null);
   const [isInsightLoading, setIsInsightLoading] = useState(false);
-  const [zoneRange, setZoneRange] = useState('Daily');
+  const [zoneRange, setZoneRange] = useState('Live');
+
+  // Pull the stored series whenever a zone drawer opens. Empty is a legitimate
+  // answer here - a socket that has never drawn has no history - so the note
+  // from the API is surfaced rather than padded out with zeroes.
+  // Clear the series the moment the selected socket changes, before anything is
+  // fetched for the new one.
+  //
+  // `data` is shared with the analytics view, and the effect below only
+  // overwrites it once its request resolves. Without this, opening socket 1
+  // straight after socket 3 left socket 3's curve on screen under socket 1's
+  // heading until the response landed - a chart that is not merely stale but
+  // attributed to the wrong socket. An empty panel saying so is the honest
+  // state while we do not yet know.
+  useEffect(() => {
+    setData([]);
+    setChartNote('');
+  }, [selectedZone?.channel]);
+
+  useEffect(() => {
+    if (!selectedZone) return;
+    let cancelled = false;
+    const load = async () => {
+      const res = await fetchChartData(apiBaseUrl, token, zoneRange, selectedZone.channel);
+      if (!cancelled) {
+        setData(res.points);
+        setChartNote(res.note);
+      }
+    };
+    load();
+    // Only the Live range moves while you are looking at it. The rollup refreshes
+    // every 30s server-side, so polling at 15s catches each new minute bucket
+    // shortly after it closes; the wider ranges would just refetch the same rows.
+    if (zoneRange !== 'Live') return () => { cancelled = true; };
+    const timer = setInterval(load, 15000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [selectedZone, zoneRange, token, apiBaseUrl]);
   const [isComparing, setIsComparing] = useState(false);
   const [toasts, setToasts] = useState<{ id: number; message: string; icon: any }[]>([]);
   const [showRuleBuilder, setShowRuleBuilder] = useState(false);
@@ -945,12 +1025,14 @@ export default function App() {
                           {isComparing ? 'Comparing' : 'Compare'}
                         </button>
                         <div className="flex gap-2 bg-bg-card/50 p-1 rounded-full shrink-0">
-                          {['Daily', 'Weekly', 'Monthly'].map(r => (
+                          {['Live', 'Daily', 'Weekly', 'Monthly'].map(r => (
                             <button
                               key={r}
-                              onClick={() => {
+                              onClick={async () => {
                                 setZoneRange(r);
-                                setData(generateChartData(r));
+                                const res = await fetchChartData(apiBaseUrl, token, r, selectedZone?.channel);
+                                setData(res.points);
+                                setChartNote(res.note);
                               }}
                               className={cn(
                                 "px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest transition-all",
@@ -964,6 +1046,17 @@ export default function App() {
                       </div>
                     </div>
                     <div className="h-56 sm:h-64 w-full bg-bg-card/10 rounded-[1.75rem] sm:rounded-[3rem] p-3 sm:p-8 relative overflow-hidden border border-olive/5">
+                      {data.length === 0 && (
+                        // An empty series is a real answer - a socket that has
+                        // never drawn has no history. Say that rather than
+                        // drawing a flat line that reads as "zero consumption".
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6">
+                          <p className="text-xs font-bold text-ink/50">No stored history for this socket yet</p>
+                          <p className="text-[11px] text-ink/30 leading-relaxed max-w-sm">
+                            {chartNote || 'Readings are rolled up hourly. Switch the socket on and give it time to accumulate.'}
+                          </p>
+                        </div>
+                      )}
                       <ResponsiveContainer width="100%" height="100%">
                         <AreaChart data={data}>
                           <defs>
@@ -1164,6 +1257,8 @@ export default function App() {
               exit={{ opacity: 0, scale: 1.02 }}
               className="space-y-8 sm:space-y-12 pb-20"
             >
+              <LiveWaveform token={token} apiBaseUrl={apiBaseUrl} />
+
               <div>
                 <h2 className="text-2xl sm:text-3xl font-display font-medium text-olive mb-2 italic">Energy Topology</h2>
                 <p className="text-[10px] text-ink/30 font-black uppercase tracking-wider sm:tracking-[0.3em] mb-6 sm:mb-10">Spatial load mapping across the mesh</p>
@@ -1222,9 +1317,11 @@ export default function App() {
               zones={zones}
               metrics={systemMetrics}
               activeRange={analyticsRange}
-              onRangeChange={(range) => {
+              onRangeChange={async (range) => {
                 setAnalyticsRange(range);
-                setData(generateChartData(range));
+                const res = await fetchChartData(apiBaseUrl, token, range);
+                setData(res.points);
+                setChartNote(res.note);
               }}
               onDetailedMap={() => setActiveView('zones')}
               insight={energyInsight}

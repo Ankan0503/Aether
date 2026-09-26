@@ -60,6 +60,13 @@ inline bool meshGatewayAlive() {
     return gatewaySeen && (millis() - lastGatewayContact < 30000);
 }
 
+// doc["mesh_id"] | "" is a const char*, and const char* == String does not
+// compile. Converting once here keeps the call sites readable and avoids three
+// separate casts that would all have to stay in step.
+inline String meshIdOf(JsonDocument& doc) {
+    return String(doc["mesh_id"] | "");
+}
+
 inline void meshBroadcast(const char* payload) {
     esp_now_send(BROADCAST_ADDR, (const uint8_t*)payload, strlen(payload));
 }
@@ -147,7 +154,7 @@ inline void meshOnEspNow(const esp_now_recv_info* info, const uint8_t* data, int
     }
 
     if (action == "HEARTBEAT") {
-        if (isPaired && (doc["mesh_id"] | "") == meshId) {
+        if (isPaired && meshIdOf(doc) == meshId) {
             lastGatewayContact = millis();
             gatewaySeen = true;
             const int channel = doc["channel"] | meshChannel;
@@ -164,7 +171,7 @@ inline void meshOnEspNow(const esp_now_recv_info* info, const uint8_t* data, int
     if (!targetMac.equalsIgnoreCase(meshMac())) {
         // Not for us - but a safety trip from a peer in the same mesh is meant
         // for everyone, and must act without the gateway's involvement.
-        if (action == "TRIP_RELAY" && isPaired && (doc["mesh_id"] | "") == meshId) {
+        if (action == "TRIP_RELAY" && isPaired && meshIdOf(doc) == meshId) {
             meshHandleCommand(action, doc);
         }
         return;
@@ -181,7 +188,7 @@ inline void meshOnEspNow(const esp_now_recv_info* info, const uint8_t* data, int
     }
 
     // Remaining commands require us to be paired into the sending mesh.
-    if (!isPaired || (doc["mesh_id"] | "") != meshId) return;
+    if (!isPaired || meshIdOf(doc) != meshId) return;
     lastGatewayContact = millis();
     meshHandleCommand(action, doc);
 }
@@ -213,7 +220,20 @@ inline void meshBegin(const char* role) {
 }
 
 inline void meshLoop(const char* role) {
-    if (isPaired) return;
+    // Paired and hearing the gateway: nothing to do.
+    if (isPaired && meshGatewayAlive()) return;
+
+    // Paired but silent for 30s means the gateway is no longer where we left
+    // it - it restarted onto a different channel, or the router moved and it
+    // followed. ESP-NOW only reaches peers on the same channel, so the node
+    // cannot receive the HEARTBEAT that would tell it where to go. It has to
+    // go looking, and until this existed it never did: it knew the gateway was
+    // gone, blinked an LED about it, and waited for a human with a BOOT button.
+    //
+    // Credentials are KEPT. We still know which mesh we belong to; we have only
+    // lost where it is. Unpairing would throw away the one thing still valid
+    // and force a needless round trip through the dashboard.
+    const bool searching = isPaired && !meshGatewayAlive();
 
     // Unpaired: announce ourselves every 3 seconds, sweeping channels so we
     // find the gateway wherever the router put it. Without the sweep a node
@@ -221,10 +241,14 @@ inline void meshLoop(const char* role) {
     if (millis() - lastDiscover > 3000) {
         lastDiscover = millis();
 
+        // Sweep channels 1-13 only until the gateway is found for the first time.
+        // Once gatewaySeen is true, lock to meshChannel so commands arrive instantly.
         if (!gatewaySeen) {
             static int sweep = 1;
             sweep = (sweep % 13) + 1;
             esp_wifi_set_channel(sweep, WIFI_SECOND_CHAN_NONE);
+        } else {
+            esp_wifi_set_channel(meshChannel, WIFI_SECOND_CHAN_NONE);
         }
 
         char payload[160];
@@ -232,6 +256,17 @@ inline void meshLoop(const char* role) {
                  "{\"action\":\"DISCOVER\",\"mac\":\"%s\",\"role\":\"%s\"}",
                  meshMac().c_str(), role);
         meshBroadcast(payload);
+
+        // Say so on serial. An unpaired node is otherwise completely silent
+        // after its boot banner scrolls away, so a node that is working looks
+        // exactly like one that is dead - which is no help at all when the
+        // mesh is not forming. Throttled to one line every few attempts.
+        static uint8_t announced = 0;
+        if ((announced++ % 4) == 0) {
+            Serial.printf("DISCOVER sent on channel %d (%s)\n", WiFi.channel(),
+                          searching ? "lost the gateway - sweeping to re-find it"
+                          : gatewaySeen ? "gateway seen" : "sweeping");
+        }
     }
 }
 

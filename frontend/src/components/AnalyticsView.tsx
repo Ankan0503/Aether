@@ -69,7 +69,7 @@ export const AnalyticsView = ({
           </motion.div>
         )}
         <div className="flex gap-2 p-1.5 bg-bg-card rounded-[2rem] border border-olive/5 overflow-x-auto no-scrollbar">
-          {['Day', 'Week', 'Month', 'Year'].map(t => (
+          {['Live', 'Day', 'Week', 'Month', 'Year'].map(t => (
             <button 
               key={t} 
               onClick={() => onRangeChange(t)}

@@ -49,8 +49,19 @@
 // ==========================================================================
 // ROLE SWITCH - uncomment exactly one, then flash.
 // ==========================================================================
-// #define DEVICE_TYPE_KITCHEN
+// Uncomment for a kitchen node, or - better - pass it at build time so the
+// file never has to be edited and the wrong role cannot be flashed by
+// forgetting to change it back:
+//
+//   arduino-cli compile --build-property \
+//       "compiler.cpp.extra_flags=-DDEVICE_TYPE_KITCHEN" firmware/AetherSubNode
+//
+#define DEVICE_TYPE_KITCHEN
+
+// Automation is the default only when nothing else was selected.
+#ifndef DEVICE_TYPE_KITCHEN
 #define DEVICE_TYPE_AUTOMATION
+#endif
 
 #if defined(DEVICE_TYPE_KITCHEN) && defined(DEVICE_TYPE_AUTOMATION)
 #error "Pick one role: a node is either the kitchen sensor or the socket relay."
@@ -108,11 +119,11 @@ unsigned long lastScan = 0;
 unsigned long lastTelemetry = 0;
 unsigned long lastSignature = 0;
 int signatureChannel = 0;
-const unsigned long telemetryIntervalMs = 2000;
-const unsigned long signatureIntervalMs = 15000;
+const unsigned long telemetryIntervalMs = 10000;    // telemetry sent every 10s (was 2s)
+const unsigned long signatureIntervalMs = 60000;    // load signatures sent every 60s (was 15s)
 unsigned long lastEvaluate = 0;
 unsigned long lastAccumulate = 0;
-const unsigned long scanIntervalMs = 3000;      // one socket measured every 3s
+const unsigned long scanIntervalMs = 10000;          // one socket measured every 10s (was 3s)
 const unsigned long evaluateIntervalMs = 1000;
 #endif
 
@@ -161,16 +172,25 @@ void printStatus() {
                   config.enabled ? "ARMED" : "disarmed",
                   (unsigned long)config.graceSeconds, (unsigned long)config.idleGraceSeconds);
     Serial.println("  -------------------------------------------------------------------");
-    Serial.println("  socket  relay   current   band     what is plugged in");
+    Serial.println("  socket  relay     ADC      amps     watts  band     what is plugged in");
     for (int i = 0; i < OCC_SOCKETS; i++) {
-        Serial.printf("    %d     %-6s  %6.1f   %-7s  %s%s\n",
+        const float adc = sockets[i].currentAdc;
+        const bool sensorFault = !wfAdcCredible(adc);
+        const float amps = wfAdcToAmps(adc);
+        // 230 V nominal. The subnode has no voltage reference, so this is an
+        // estimate and is labelled as one - the gateway is where true power
+        // with a measured power factor comes from.
+        Serial.printf("    %d     %-6s  %7.1f  %7.3f  %7.1f  %-7s  %s%s\n",
                       i + 1,
                       sockets[i].relayClosed ? "closed" : "open",
-                      sockets[i].currentAdc,
+                      adc, amps, amps * 230.0f,
                       occLoadBand(sockets[i]),
                       sockets[i].loadType,
-                      sockets[i].cutByRule ? "   [cut by Aether]" : "");
+                      sensorFault ? "   [FAULT: sensor reading impossible - check wiring]"
+                      : sockets[i].contactsStuck ? "   [FAULT: WILL NOT OPEN]"
+                      : sockets[i].cutByRule ? "   [cut by Aether]" : "");
     }
+    Serial.println("  (watts estimated at 230 V nominal; the gateway measures true power)");
 
     // Only meaningful once something has been cut.
     float totalSaved = 0;
@@ -256,21 +276,61 @@ void meshHandleCommand(const String& action, JsonDocument& doc) {
     }
     return;
 #else
-    if (action == "RELAY_ON" || action == "RELAY_OFF") {
-        const int socket = doc["channel"] | doc["socket_id"] | 0;
+    if (action == "CONTROL_RELAY" || action == "RELAY_ON" || action == "RELAY_OFF") {
+        // The dashboard sends CONTROL_RELAY with a "state" boolean. RELAY_ON and
+        // RELAY_OFF are accepted too, so a command sent by hand over MQTT still
+        // works and older tooling does not break.
+        const bool wanted = (action == "CONTROL_RELAY") ? (doc["state"] | false)
+                                                        : (action == "RELAY_ON");
+
+        // Chaining | across two JsonVariants is ambiguous in ArduinoJson 7, so
+        // resolve them one at a time.
+        int channel = doc["channel"] | 0;
+        if (channel == 0) channel = doc["socket_id"] | 0;
+
+        // The backend addresses the relay board's HARDWARE channel, not the
+        // socket number: socket 3 was moved to the board's channel 4 after
+        // channel 3 kept sticking, so the two stopped being the same thing.
+        // Translating here means the firmware follows the wiring and the
+        // backend's map stays the single source of truth.
+        int socket = 0;
+        switch (channel) {
+            case 1: socket = 1; break;
+            case 2: socket = 2; break;
+            case 4: socket = 3; break;   // hardware channel 4 drives socket 3
+            case 3: socket = 0; break;   // unused on this wiring
+            default: socket = 0; break;
+        }
+
         if (socket >= 1 && socket <= OCC_SOCKETS) {
-            setRelay(socket - 1, action == "RELAY_ON", false);
+            Serial.printf("Dashboard: socket %d (hw channel %d) -> %s\n",
+                          socket, channel, wanted ? "ON" : "OFF");
+            setRelay(socket - 1, wanted, false);
+        } else {
+            Serial.printf("Ignoring relay command for unknown channel %d\n", channel);
         }
     } else if (action == "TRIP_RELAY") {
         // A gas or fire trip from the kitchen node. Everything off, now.
         // This arrives peer-to-peer over ESP-NOW, so it works with the gateway
         // and the internet both down - which is the point.
         Serial.println("EMERGENCY TRIP from the safety node - opening every socket");
-        for (int i = 0; i < OCC_SOCKETS; i++) setRelay(i, false, false);
+
+        // Staggered by a few milliseconds each. Three relay coils changing
+        // state on the same instant pull a current spike big enough to dip a
+        // shared 5V rail and brown out the ESP32 - which resets the node in the
+        // middle of the emergency it is responding to. The total delay is under
+        // 30ms, far below anything that matters for safety, and it keeps the
+        // node alive to keep alarming and to be restored afterwards.
+        for (int i = 0; i < OCC_SOCKETS; i++) {
+            setRelay(i, false, false);
+            delay(12);
+        }
     } else if (action == "SET_GRACE") {
         config.graceSeconds = (uint32_t)(doc["seconds"] | (int)config.graceSeconds);
+        occSaveConfig(config);
     } else if (action == "ARM_CUTOFF") {
         config.enabled = doc["enabled"] | true;
+        occSaveConfig(config);
         Serial.printf("Cutoff %s from the dashboard\n", config.enabled ? "armed" : "disarmed");
     }
 #endif
@@ -348,6 +408,10 @@ void printKitchenStatus() {
 #ifdef DEVICE_TYPE_AUTOMATION
 // Combined telemetry in the shape the backend already parses: c1/c2/c4 map to
 // sockets 1/2/3, since socket 3 runs through the relay board's channel 4.
+//
+// The current fields are AMPS, not the raw ADC counts this used to send. The
+// backend computes power as current * 230 V, so sending counts inflated every
+// reading by ~82x and made an idle socket look like a space heater.
 void publishTelemetry() {
     if (!meshIsPaired()) return;
     char payload[320];
@@ -357,9 +421,12 @@ void publishTelemetry() {
         "\"c1\":%.3f,\"c2\":%.3f,\"c3\":0.000,\"c4\":%.3f,"
         "\"r1\":%d,\"r2\":%d,\"r4\":%d}",
         meshMac().c_str(), meshCurrentId().c_str(),
-        sockets[0].currentAdc + sockets[1].currentAdc + sockets[2].currentAdc,
+        wfAdcToAmps(sockets[0].currentAdc) + wfAdcToAmps(sockets[1].currentAdc)
+            + wfAdcToAmps(sockets[2].currentAdc),
         room.motionNow ? 1 : 0,
-        sockets[0].currentAdc, sockets[1].currentAdc, sockets[2].currentAdc,
+        wfAdcToAmps(sockets[0].currentAdc),
+        wfAdcToAmps(sockets[1].currentAdc),
+        wfAdcToAmps(sockets[2].currentAdc),
         sockets[0].relayClosed ? 1 : 0,
         sockets[1].relayClosed ? 1 : 0,
         sockets[2].relayClosed ? 1 : 0);
@@ -378,7 +445,7 @@ void publishSignature(int index) {
     if (!signature.valid) return;
 
     char payload[250];
-    const int written = wfBuildPayload(signature, index + 1, meshMac(), payload, sizeof(payload));
+    const int written = wfBuildPayload(signature, index + 1, meshMac(), meshCurrentId(), payload, sizeof(payload));
     if (written > 0 && written < (int)sizeof(payload)) {
         meshBroadcast(payload);
         Serial.printf("Published socket %d signature: %s (crest %.2f)\n",
@@ -402,6 +469,22 @@ void checkResetButton() {
         Serial.println("Unpair requested from the BOOT button.");
         meshUnpair();
     }
+}
+
+// The status LED reports MESH state, not sensing state. Occupancy and hazards
+// are already visible on serial and in the dashboard; whether the node has
+// found its gateway is the one thing you cannot otherwise see, and it is the
+// first question worth answering when something is not appearing.
+//
+//   fast blink  searching for a gateway (unpaired)
+//   slow blink  paired, but nothing heard from the gateway recently
+//   solid       paired and the gateway is alive
+void updateStatusLed() {
+    bool on;
+    if (!meshIsPaired())          on = (millis() / 150) % 2;
+    else if (!meshGatewayAlive()) on = (millis() / 800) % 2;
+    else                          on = true;
+    digitalWrite(STATUS_LED, on);
 }
 
 void printNetworkStatus() {
@@ -487,7 +570,18 @@ void setup() {
                   RELAY_PINS[0], RELAY_PINS[1], RELAY_PINS[2],
                   CURRENT_PINS[0], CURRENT_PINS[1], CURRENT_PINS[2]);
     Serial.printf("PIR on GPIO %d. All sockets open.\n", PIR_PIN);
-    Serial.println("Cutoff is DISARMED until you type 'arm'.");
+
+    // Restore the cutoff settings from NVS before the first decision is made.
+    occLoadConfig(config);
+    if (config.enabled) {
+        Serial.printf("Cutoff is ARMED: active loads cut after %lus without motion,"
+                      " idling loads after %lus.\n",
+                      (unsigned long)config.graceSeconds,
+                      (unsigned long)config.idleGraceSeconds);
+        Serial.println("Type 'disarm' to stop it acting.");
+    } else {
+        Serial.println("Cutoff is DISARMED (saved setting). Type 'arm' to enable it.");
+    }
 
     meshBegin(NODE_ROLE);
     printHelp();
@@ -525,7 +619,10 @@ void loop() {
     }
 
     // Solid while a hazard is latched, slow blink when clear.
-    digitalWrite(STATUS_LED, hazardStatus != "SAFE" ? HIGH : ((millis() / 1000) % 2));
+    // A hazard overrides everything - a fast double-rate flash that cannot be
+    // confused with either mesh state.
+    if (hazardStatus != "SAFE") digitalWrite(STATUS_LED, (millis() / 100) % 2);
+    else updateStatusLed();
     return;
 #else
     occUpdate(room, PIR_PIN);
@@ -554,17 +651,21 @@ void loop() {
             for (int i = 0; i < OCC_SOCKETS; i++) identifySocket(i);
         } else if (lower == "arm") {
             config.enabled = true;
+            occSaveConfig(config);
             Serial.printf("Cutoff ARMED. Active loads cut after %lus without motion,\n",
                           (unsigned long)config.graceSeconds);
             Serial.printf("idling loads after %lus.\n", (unsigned long)config.idleGraceSeconds);
         } else if (lower == "disarm") {
             config.enabled = false;
+            occSaveConfig(config);
             Serial.println("Cutoff disarmed. Sockets stay as they are.");
         } else if (lower.startsWith("grace ")) {
             config.graceSeconds = (uint32_t)lower.substring(6).toInt();
+            occSaveConfig(config);
             Serial.printf("Active-load grace period: %lus\n", (unsigned long)config.graceSeconds);
         } else if (lower.startsWith("idle ")) {
             config.idleGraceSeconds = (uint32_t)lower.substring(5).toInt();
+            occSaveConfig(config);
             Serial.printf("Idle-load grace period: %lus\n", (unsigned long)config.idleGraceSeconds);
         } else if (lower == "pir") {
             const uint32_t quiet = occSecondsSinceMotion(room);
@@ -610,8 +711,28 @@ void loop() {
     // sampling plus the DFT - never stalls the loop for long.
     if (millis() - lastScan > scanIntervalMs) {
         lastScan = millis();
-        if (sockets[scanChannel].relayClosed) refreshSocket(scanChannel);
-        else sockets[scanChannel].currentAdc = 0;
+
+        // Measure every socket, open or closed. Only measuring the ones we
+        // believe are closed makes the single worst failure invisible: a relay
+        // whose contacts have welded shut still passes current while the node
+        // reports it open, so the safety cutoff silently does nothing. Current
+        // flowing through a socket we commanded open is the evidence, and it is
+        // only available if we look.
+        refreshSocket(scanChannel);
+
+        SocketState& sock = sockets[scanChannel];
+        if (!sock.relayClosed && sock.currentAdc >= OCC_NOISE_FLOOR_ADC) {
+            if (!sock.contactsStuck) {
+                sock.contactsStuck = true;
+                Serial.printf("\n[FAULT] socket %d is OPEN but drawing %.1f ADC rms.\n",
+                              scanChannel + 1, sock.currentAdc);
+                Serial.println("        The relay contacts are not releasing. That socket");
+                Serial.println("        cannot be switched off - treat it as permanently live.");
+            }
+        } else if (sock.relayClosed || sock.currentAdc < OCC_NOISE_FLOOR_ADC) {
+            sock.contactsStuck = false;
+        }
+
         scanChannel = (scanChannel + 1) % OCC_SOCKETS;
     }
 
@@ -626,7 +747,6 @@ void loop() {
         for (int i = 0; i < OCC_SOCKETS; i++) occAccumulateSaving(sockets[i], elapsed);
     }
 
-    // Solid while someone is present, slow blink when the room is empty.
-    digitalWrite(STATUS_LED, room.motionNow ? HIGH : ((millis() / 1000) % 2));
+    updateStatusLed();
 #endif
 }
